@@ -1,4 +1,4 @@
-# 🤖 PIXLE.AI — Full-Stack AI Chatbot
+# 🤖 Starfam.AI — Full-Stack AI Chatbot
 
 PIXLE.AI is a modern, fast, and responsive full-stack AI conversational chatbot application. It leverages **Python FastAPI** for the backend, **Groq API** for ultra-fast open-source LLM inference, and clean **HTML/CSS/JS** for an intuitive frontend experience.
 
