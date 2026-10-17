@@ -32,7 +32,7 @@ load_dotenv()  # Reads GROQ_API_KEY (and optional overrides) from the .env file
 
 BASE_DIR = Path(__file__).resolve().parent
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-MODEL_NAME = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+MODEL_NAME = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
 
 # Personality and ground rules sent with every request
 SYSTEM_PROMPT = (
