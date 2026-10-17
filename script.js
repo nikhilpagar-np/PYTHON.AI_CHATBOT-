@@ -1,68 +1,144 @@
-/* =========================================================
-   PIXLE.AI — chat logic + FastAPI backend communication
+ /* =========================================================
+   starfam.ai — chat logic (simple version)
+   Parts:  1 Settings   2 Page elements   3 Saved chats
+           4 Drawing messages   5 Talking to the server
+           6 Buttons   7 Star background   8 Start
    ========================================================= */
 (() => {
   'use strict';
 
-  // ---------- Config ----------
+  /* ---------- 1. Settings ---------- */
+  // This is YOUR server address. Do not change it, or the chatbot stops answering.
   const API_URL = 'https://pixle-ai.onrender.com/chat';
-  const REQUEST_TIMEOUT_MS = 60000;
-  const STORAGE_KEY = 'pixle-ai-chats';
+  const TIMEOUT_MS = 60000;                 // give up after 60 seconds
+  const SAVE_KEY = 'starfam-ai-chats';      // where chats are saved in the browser
+  const LOGO = 'images/logo.png';           // full logo
+  const SPINNER = 'images/star.png';        // star that spins while thinking
 
-  // ---------- DOM ----------
+  /* ---------- 2. Page elements ---------- */
   const $ = (id) => document.getElementById(id);
   const app = $('app');
-  const messagesEl = $('messages');
-  const inputEl = $('input');
+  const messagesBox = $('messages');
+  const input = $('input');
   const sendBtn = $('sendBtn');
-  const historyEl = $('historyList');
-  const statusEl = $('status');
+  const historyBox = $('historyList');
+  const statusBox = $('status');
   const statusText = $('statusText');
+  const toast = $('toast');
 
-  // ---------- State ----------
-  let chats = loadChats();      // [{ id, title, messages: [{role, text, error?}] }]
-  let activeId = null;
-  let busy = false;
+  // chats = [{ id, title, messages: [{ role: 'user' or 'bot', text, error, retryText }] }]
+  let chats = loadChats();
+  let activeId = null;       // which chat is open
+  let waiting = false;       // true while we wait for the AI
 
-  // ---------- Persistence (safe: storage can be unavailable) ----------
+  /* ---------- 3. Saved chats ---------- */
   function loadChats() {
-    try { return JSON.parse(localStorage.getItem(STORAGE_KEY)) || []; }
+    try { return JSON.parse(localStorage.getItem(SAVE_KEY)) || []; }
     catch { return []; }
   }
   function saveChats() {
-    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(chats)); } catch { /* ignore */ }
+    try { localStorage.setItem(SAVE_KEY, JSON.stringify(chats)); } catch { /* storage blocked */ }
+  }
+  const currentChat = () => chats.find((c) => c.id === activeId);
+
+  /* ---------- 4. Drawing messages ---------- */
+
+  // Make text safe, so nobody can sneak HTML into the page
+  function safe(text) {
+    return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
   }
 
-  // ---------- Helpers ----------
-  const activeChat = () => chats.find((c) => c.id === activeId);
-
-  /** Escape HTML so model/user text can never inject markup. */
-  const escapeHtml = (s) =>
-    s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-
-  /** Tiny, safe markdown: ```code blocks```, `inline code`, **bold**, paragraphs. */
+  // Turn AI text into HTML: ```code```, `code`, **bold** and paragraphs
   function formatReply(text) {
-    const blocks = [];
-    let html = escapeHtml(text).replace(/```(?:\w+)?\n?([\s\S]*?)```/g, (_, code) => {
-      blocks.push(`<pre><code>${code.trim()}</code></pre>`);
-      return `\u0000${blocks.length - 1}\u0000`;
+    const codeBlocks = [];
+    let html = safe(text).replace(/```(?:\w+)?\n?([\s\S]*?)```/g, (_, code) => {
+      codeBlocks.push(`<pre><code>${code.trim()}</code></pre>`);
+      return `\u0000${codeBlocks.length - 1}\u0000`;
     });
     html = html
       .replace(/`([^`\n]+)`/g, '<code>$1</code>')
       .replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>')
       .split(/\n{2,}/)
-      .map((p) => (p.startsWith('\u0000') ? p : `<p>${p.replace(/\n/g, '<br>')}</p>`))
+      .map((part) => (part.startsWith('\u0000') ? part : `<p>${part.replace(/\n/g, '<br>')}</p>`))
       .join('');
-    return html.replace(/\u0000(\d+)\u0000/g, (_, i) => blocks[i]);
+    return html.replace(/\u0000(\d+)\u0000/g, (_, i) => codeBlocks[i]);
   }
 
-  const scrollToBottom = () => { messagesEl.scrollTop = messagesEl.scrollHeight; };
+  function showToast(text) {            // small "Copied" popup
+    toast.textContent = text;
+    toast.classList.add('show');
+    setTimeout(() => toast.classList.remove('show'), 1800);
+  }
 
-  // ---------- Rendering ----------
-  function renderHistory() {
-    historyEl.innerHTML = '';
+  async function copyText(text) {
+    try { await navigator.clipboard.writeText(text); showToast('Copied'); }
+    catch { showToast('Copy failed'); }
+  }
+
+  function scrollDown() { messagesBox.scrollTop = messagesBox.scrollHeight; }
+
+  // Small button under a reply (Copy / Regenerate / Retry)
+  function makeButton(label, onClick, extraClass = '') {
+    const button = document.createElement('button');
+    button.className = `action-btn ${extraClass}`.trim();
+    button.textContent = label;
+    button.addEventListener('click', onClick);
+    return button;
+  }
+
+  // Add one message to the screen
+  function showMessage(msg, isLast = true) {
+    const row = document.createElement('div');
+    row.className = `msg ${msg.role}${msg.error ? ' error' : ''}`;
+    if (msg.role === 'bot') row.innerHTML = `<div class="ai-icon"><img src="${LOGO}" alt="" /></div>`;
+
+    const body = document.createElement('div');
+    body.className = 'msg-body';
+    const bubble = document.createElement('div');
+    bubble.className = 'bubble';
+    if (msg.role === 'user') bubble.textContent = msg.text;
+    else bubble.innerHTML = formatReply(msg.text);
+    body.appendChild(bubble);
+
+    if (msg.role === 'bot') {
+      const buttons = document.createElement('div');
+      buttons.className = 'msg-actions';
+      if (msg.error) {
+        buttons.appendChild(makeButton('Retry', () => retry(msg), 'regen'));
+      } else {
+        buttons.appendChild(makeButton('Copy', () => copyText(msg.text)));
+        if (isLast) buttons.appendChild(makeButton('Regenerate', () => regenerate(msg), 'regen'));
+      }
+      body.appendChild(buttons);
+    }
+
+    row.appendChild(body);
+    messagesBox.appendChild(row);
+    scrollDown();
+  }
+
+  function showWelcome() {
+    messagesBox.innerHTML = `
+      <div class="welcome">
+        <img src="${LOGO}" alt="starfam.ai star logo" />
+        <h2>Explore the universe of ideas.</h2>
+        <p>One Life. A Million Things to Discover.<br>Explore, Create &amp; Imagine with StarFam AI.</p>
+      </div>`;
+  }
+
+  // Draw the whole open chat
+  function showChat() {
+    const chat = currentChat();
+    messagesBox.innerHTML = '';
+    if (!chat || !chat.messages.length) return showWelcome();
+    chat.messages.forEach((msg, i) => showMessage(msg, i === chat.messages.length - 1));
+  }
+
+  // Draw the chat list in the sidebar
+  function showHistory() {
+    historyBox.innerHTML = '';
     if (!chats.length) {
-      historyEl.innerHTML = '<p class="history-empty label">No chats yet</p>';
+      historyBox.innerHTML = '<p class="history-empty label">No chats yet</p>';
       return;
     }
     chats.forEach((chat) => {
@@ -72,222 +148,263 @@
       item.setAttribute('role', 'button');
       item.innerHTML = `
         <svg viewBox="0 0 24 24"><path d="M21 12a8 8 0 0 1-11.6 7.1L4 20l1-4.6A8 8 0 1 1 21 12z"/></svg>
-        <span>${escapeHtml(chat.title)}</span>
-        <button class="del" aria-label="Delete chat"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button>`;
+        <span>${safe(chat.title)}</span>
+        <button class="del" aria-label="Delete chat" title="Delete chat"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button>`;
       item.addEventListener('click', () => openChat(chat.id));
-      item.addEventListener('keydown', (e) => { if (e.key === 'Enter') openChat(chat.id); });
+      item.addEventListener('keydown', (e) => { if (e.key === 'Enter' && e.target === item) openChat(chat.id); });
       item.querySelector('.del').addEventListener('click', (e) => { e.stopPropagation(); deleteChat(chat.id); });
-      historyEl.appendChild(item);
+      historyBox.appendChild(item);
     });
   }
 
-  function renderWelcome() {
-    messagesEl.innerHTML = `
-      <div class="welcome">
-        <div class="logo">P</div>
-        <h2>What can I help you with?</h2>
-        <p>Ask a question, brainstorm an idea, or get help with code.</p>
-        <div class="suggestions">
-          <button>Explain quantum computing simply</button>
-          <button>Write a Python function to sort a list</button>
-          <button>Plan a 3-day trip to Goa</button>
-        </div>
-      </div>`;
-    messagesEl.querySelectorAll('.suggestions button').forEach((b) =>
-      b.addEventListener('click', () => { inputEl.value = b.textContent; sendMessage(); }));
-  }
-
-  function renderMessages() {
-    const chat = activeChat();
-    messagesEl.innerHTML = '';
-    if (!chat || !chat.messages.length) return renderWelcome();
-    chat.messages.forEach((m) => appendMessage(m, false));
-    scrollToBottom();
-  }
-
-  /** Build a message row and add it to the container. */
-  function appendMessage(msg, scroll = true) {
+  // The spinning star shown while the AI is thinking
+  function showThinking() {
     const row = document.createElement('div');
-    row.className = `msg ${msg.role}${msg.error ? ' error' : ''}`;
-    if (msg.role === 'bot') row.innerHTML = '<div class="ai-icon">P</div>';
-
-    const bubble = document.createElement('div');
-    bubble.className = 'bubble';
-    if (msg.role === 'user') bubble.textContent = msg.text;
-    else bubble.innerHTML = formatReply(msg.text);
-
-    // Retry button on failed requests
-    if (msg.error && msg.retryText) {
-      const btn = document.createElement('button');
-      btn.className = 'retry';
-      btn.textContent = 'Retry';
-      btn.addEventListener('click', () => {
-        const chat = activeChat();
-        chat.messages = chat.messages.filter((m) => m !== msg); // drop the error
-        saveChats();
-        row.remove();
-        requestReply(msg.retryText);
-      });
-      bubble.appendChild(btn);
-    }
-
-    row.appendChild(bubble);
-    messagesEl.appendChild(row);
-    if (scroll) scrollToBottom();
-    return row;
+    row.className = 'msg bot thinking';
+    row.id = 'thinking';
+    row.innerHTML = `
+      <img class="spinner" src="${SPINNER}" alt="" />
+      <div class="bubble">starfam.ai is thinking…</div>`;
+    messagesBox.appendChild(row);
+    scrollDown();
   }
+  function hideThinking() { const row = $('thinking'); if (row) row.remove(); }
 
-  // ---------- Typing indicator ----------
-  function showTyping() {
-    const row = document.createElement('div');
-    row.className = 'msg bot typing';
-    row.id = 'typing';
-    row.innerHTML = `<div class="ai-icon">P</div>
-      <div class="bubble"><span class="dots"><i></i><i></i><i></i></span><span>PIXLE.AI is thinking...</span></div>`;
-    messagesEl.appendChild(row);
-    scrollToBottom();
+  function setWaiting(value) {
+    waiting = value;
+    messagesBox.setAttribute('aria-busy', String(value));
+    updateSendButton();
   }
-  const hideTyping = () => { const t = $('typing'); if (t) t.remove(); };
+  function updateSendButton() { sendBtn.disabled = waiting || !input.value.trim(); }
 
-  // ---------- Chat management ----------
+  /* ---------- Chat list actions ---------- */
+  function closeSidebar() { app.classList.remove('open'); }
+
   function newChat() {
-    // Reuse an existing empty chat instead of piling up blanks
-    const empty = chats.find((c) => !c.messages.length);
-    if (empty) { activeId = empty.id; }
-    else {
+    if (waiting) return;
+    const emptyChat = chats.find((c) => !c.messages.length);   // reuse a blank chat
+    if (emptyChat) {
+      activeId = emptyChat.id;
+    } else {
       const chat = { id: Date.now().toString(36), title: 'New chat', messages: [] };
       chats.unshift(chat);
       activeId = chat.id;
     }
-    saveChats(); renderHistory(); renderMessages();
-    app.classList.remove('open');
-    inputEl.focus();
+    saveChats(); showHistory(); showChat(); closeSidebar();
+    input.focus();
   }
 
   function openChat(id) {
-    if (busy) return;
+    if (waiting) return;
     activeId = id;
-    renderHistory(); renderMessages();
-    app.classList.remove('open');
+    showHistory(); showChat(); closeSidebar();
   }
 
   function deleteChat(id) {
-    if (busy) return;
+    if (waiting) return;
     chats = chats.filter((c) => c.id !== id);
     if (id === activeId) activeId = chats[0]?.id ?? null;
     if (!activeId) return newChat();
-    saveChats(); renderHistory(); renderMessages();
+    saveChats(); showHistory(); showChat();
   }
 
-  // ---------- Backend communication ----------
+  function clearChat() {
+    const chat = currentChat();
+    if (!chat || waiting || !chat.messages.length) return;
+    chat.messages = [];
+    chat.title = 'New chat';
+    saveChats(); showHistory(); showChat();
+  }
+
+  function copyWholeChat() {
+    const chat = currentChat();
+    if (!chat || !chat.messages.length) return showToast('Nothing to copy yet');
+    const text = chat.messages
+      .filter((m) => !m.error)
+      .map((m) => `${m.role === 'user' ? 'You' : 'starfam.ai'}: ${m.text}`)
+      .join('\n\n');
+    copyText(text);
+  }
+
+  /* ---------- 5. Talking to the server ---------- */
   function setStatus(online) {
-    statusEl.classList.toggle('offline', !online);
+    statusBox.classList.toggle('offline', !online);
     statusText.textContent = online ? 'Online' : 'Offline';
   }
 
-  /** POST the message to FastAPI and return the `reply` string. */
-  async function callBackend(message) {
+  // Send the question to the server and return its answer
+  async function askServer(message) {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
     try {
-      const res = await fetch(API_URL, {
+      const response = await fetch(API_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ message }),
         signal: controller.signal,
       });
-      if (!res.ok) throw new Error(`Server responded with ${res.status}`);
-      const data = await res.json();
-      if (typeof data.reply !== 'string') throw new Error('Unexpected response format');
+      if (!response.ok) throw new Error(`Server responded with ${response.status}`);
+      const data = await response.json();
+      if (typeof data.reply !== 'string' || !data.reply.trim()) throw new Error('Unexpected response format');
       return data.reply;
     } finally {
       clearTimeout(timer);
     }
   }
 
-  async function requestReply(text) {
-    const chat = activeChat();
-    busy = true; sendBtn.disabled = true;
-    showTyping();
+  function errorText(err) {
+    if (err.name === 'AbortError') return 'The request took too long. The server may be waking up, so try again in a moment.';
+    if (err instanceof TypeError) return 'Can’t reach the starfam.ai server. Check your internet, then retry. If the server was idle, it can take up to a minute to wake up.';
+    return `Something went wrong: ${err.message}`;
+  }
+
+  // Get an answer for `text` and show it
+  async function getReply(text) {
+    const chat = currentChat();
+    if (!chat) return;
+    document.querySelectorAll('.regen').forEach((b) => b.remove());   // only the newest reply keeps its button
+    setWaiting(true);
+    showThinking();
     try {
-      const reply = await callBackend(text);
-      hideTyping();
-      const msg = { role: 'bot', text: reply };
+      const msg = { role: 'bot', text: await askServer(text) };
+      hideThinking();
       chat.messages.push(msg);
-      appendMessage(msg);
+      showMessage(msg);
       setStatus(true);
     } catch (err) {
-      hideTyping();
-      const timedOut = err.name === 'AbortError';
-      const unreachable = err instanceof TypeError; // network / CORS failure
-      const text_ = timedOut
-        ? 'The request took too long. Try again in a moment.'
-        : unreachable
-          ? 'Can’t reach the PIXLE.AI server at 127.0.0.1:8000. Check that FastAPI is running and CORS is enabled.'
-          : `Something went wrong: ${err.message}`;
-      const msg = { role: 'bot', text: text_, error: true, retryText: text };
+      hideThinking();
+      const msg = { role: 'bot', text: errorText(err), error: true, retryText: text };
       chat.messages.push(msg);
-      appendMessage(msg);
-      setStatus(!unreachable);
+      showMessage(msg);
+      setStatus(!(err instanceof TypeError));
     } finally {
-      busy = false;
-      sendBtn.disabled = !inputEl.value.trim();
+      setWaiting(false);
       saveChats();
-      inputEl.focus();
+      input.focus();
     }
   }
 
-  async function sendMessage() {
-    const text = inputEl.value.trim();
-    if (!text || busy) return;
-    if (!activeChat()) newChat();
-    const chat = activeChat();
+  function retry(errorMsg) {            // try again after an error
+    if (waiting) return;
+    const chat = currentChat();
+    chat.messages = chat.messages.filter((m) => m !== errorMsg);
+    showChat();
+    getReply(errorMsg.retryText);
+  }
 
-    // First message: clear welcome screen and title the chat
-    if (!chat.messages.length) {
-      messagesEl.innerHTML = '';
+  function regenerate(botMsg) {         // ask the same question again
+    if (waiting) return;
+    const chat = currentChat();
+    const index = chat.messages.indexOf(botMsg);
+    const question = chat.messages.slice(0, index).reverse().find((m) => m.role === 'user');
+    if (!question) return;
+    chat.messages.splice(index, 1);
+    showChat();
+    getReply(question.text);
+  }
+
+  async function sendMessage() {
+    const text = input.value.trim();
+    if (!text || waiting) return;                 // ignore empty or double sends
+    if (!currentChat()) newChat();
+    const chat = currentChat();
+
+    if (!chat.messages.length) {                  // first message: name the chat
+      messagesBox.innerHTML = '';
       chat.title = text.length > 34 ? text.slice(0, 34) + '…' : text;
-      renderHistory();
+      showHistory();
     }
 
     const msg = { role: 'user', text };
     chat.messages.push(msg);
-    appendMessage(msg);
-    inputEl.value = '';
-    autoResize();
+    document.querySelectorAll('.regen').forEach((b) => b.remove());
+    showMessage(msg);
+    input.value = '';
+    resizeInput();
     saveChats();
-    await requestReply(text);
+    await getReply(text);
   }
 
-  // ---------- Input behaviour ----------
-  function autoResize() {
-    inputEl.style.height = 'auto';
-    inputEl.style.height = Math.min(inputEl.scrollHeight, 160) + 'px';
-    sendBtn.disabled = busy || !inputEl.value.trim();
+  /* ---------- 6. Buttons and typing ---------- */
+  function resizeInput() {                        // the box grows as you type
+    input.style.height = 'auto';
+    input.style.height = Math.min(input.scrollHeight, 160) + 'px';
+    updateSendButton();
   }
 
-  inputEl.addEventListener('input', autoResize);
-  inputEl.addEventListener('keydown', (e) => {
+  input.addEventListener('input', resizeInput);
+  input.addEventListener('keydown', (e) => {
+    // Enter sends. Shift+Enter makes a new line.
     if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); sendMessage(); }
   });
   sendBtn.addEventListener('click', sendMessage);
-
-  // ---------- Sidebar & header controls ----------
   $('newChatBtn').addEventListener('click', newChat);
   $('collapseBtn').addEventListener('click', () => app.classList.toggle('collapsed'));
   $('menuBtn').addEventListener('click', () => app.classList.toggle('open'));
-  $('clearBtn').addEventListener('click', () => {
-    const chat = activeChat();
-    if (!chat || busy) return;
-    chat.messages = []; chat.title = 'New chat';
-    saveChats(); renderHistory(); renderMessages();
-  });
-  // Tap outside the sidebar to close it on mobile
-  messagesEl.addEventListener('click', () => app.classList.remove('open'));
+  $('backdrop').addEventListener('click', closeSidebar);
+  $('clearBtn').addEventListener('click', clearChat);
+  $('copyChatBtn').addEventListener('click', copyWholeChat);
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeSidebar(); });
 
-  // ---------- Init ----------
+  /* ---------- 7. Star background ----------
+     Stars have a depth. Near stars are bigger and move more when you move the mouse. */
+  function startStars() {
+    const canvas = $('starfield');
+    const ctx = canvas.getContext('2d');
+    const universe = canvas.parentElement;
+    const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    let width, height, stars = [], mouseX = 0, mouseY = 0, shiftX = 0, shiftY = 0;
+
+    function makeStars() {
+      width = window.innerWidth;
+      height = window.innerHeight;
+      canvas.width = width;
+      canvas.height = height;
+      const count = width < 700 ? 90 : 180;
+      stars = Array.from({ length: count }, () => ({
+        x: Math.random(), y: Math.random(),
+        depth: Math.random() * 0.9 + 0.1,          // 0.1 = far, 1 = near
+        blink: Math.random() * 6,
+      }));
+    }
+
+    function draw(time) {
+      ctx.clearRect(0, 0, width, height);
+      stars.forEach((star) => {
+        const x = star.x * width + shiftX * star.depth * 46;
+        const y = star.y * height + shiftY * star.depth * 46;
+        const blink = reduceMotion ? 1 : 0.75 + 0.25 * Math.sin(time / 900 + star.blink);
+        ctx.fillStyle = `rgba(207, 224, 255, ${(0.25 + 0.75 * star.depth) * blink})`;
+        ctx.beginPath();
+        ctx.arc(x, y, 0.4 + star.depth * 1.5, 0, Math.PI * 2);
+        ctx.fill();
+      });
+    }
+
+    function animate(time) {
+      shiftX += (mouseX - shiftX) * 0.04;          // move smoothly toward the mouse
+      shiftY += (mouseY - shiftY) * 0.04;
+      universe.style.setProperty('--px', (shiftX * -16).toFixed(1) + 'px');
+      universe.style.setProperty('--py', (shiftY * -16).toFixed(1) + 'px');
+      stars.forEach((star) => { star.x += 0.00006 * star.depth; if (star.x > 1.02) star.x = -0.02; });
+      draw(time);
+      requestAnimationFrame(animate);
+    }
+
+    makeStars();
+    window.addEventListener('resize', () => { makeStars(); draw(0); });
+    if (reduceMotion) return draw(0);              // still picture for reduced motion
+    window.addEventListener('pointermove', (e) => {
+      mouseX = e.clientX / width - 0.5;
+      mouseY = e.clientY / height - 0.5;
+    }, { passive: true });
+    requestAnimationFrame(animate);
+  }
+
+  /* ---------- 8. Start ---------- */
+  startStars();
   activeId = chats[0]?.id ?? null;
   if (!activeId) newChat();
-  else { renderHistory(); renderMessages(); }
-  autoResize();
+  else { showHistory(); showChat(); }
+  resizeInput();
 })();
